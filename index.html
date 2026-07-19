@@ -674,6 +674,30 @@ def generate_seasonal_files_on_demand():
             s.textContent = msg;
             s.className = className || '';
         }
+
+        function updateFileList() {
+    const fileList = document.getElementById('fileList');
+    fileList.innerHTML = '';
+    document.getElementById('downloads').style.display = 'block';
+    
+    // Сортируем файлы: сначала summary, потом filtered, потом сезоны
+    const sortedKeys = Object.keys(processedFiles).sort((a, b) => {
+        if (a.includes('summary')) return -1;
+        if (b.includes('summary')) return 1;
+        return a.localeCompare(b);
+    });
+    
+    for (let filename of sortedKeys) {
+        const a = document.createElement('a');
+        a.href = '#';
+        a.textContent = '📄 ' + filename;
+        a.onclick = (e) => {
+            e.preventDefault();
+            downloadSingle(filename, processedFiles[filename]);
+        };
+        fileList.appendChild(a);
+    }
+}
         
         async function init() {
             try {
@@ -700,11 +724,45 @@ def generate_seasonal_files_on_demand():
         }
         
         async function processFiles() {
-            const files = document.getElementById('fileInput').files;
-            if (files.length === 0) {
-                alert('Выберите хотя бы один CSV файл!');
-                return;
-            }
+    const files = document.getElementById('fileInput').files;
+    if (files.length === 0) {
+        alert('Выберите хотя бы один CSV файл!');
+        return;
+    }
+    
+    setStatus('⚙️ Базовая обработка файлов...', 'working');
+    document.getElementById('processBtn').disabled = true;
+    document.getElementById('seasonalBtn').style.display = 'none'; // Скрываем кнопку сезонов
+    document.getElementById('log').textContent = '';
+    processedFiles = {};
+    
+    const filesDict = {};
+    for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        filesDict[file.name] = await file.text();
+    }
+    
+    try {
+        pyodide.globals.set('input_files', filesDict);
+        await pyodide.runPythonAsync(`result = process_all_files(input_files)`);
+        const result = pyodide.globals.get('result').to_py();
+        
+        processedFiles = result;
+        updateFileList();
+        
+        // Показываем кнопку для генерации сезонов, если обработка прошла успешно
+        document.getElementById('seasonalBtn').disabled = false;
+        document.getElementById('seasonalBtn').style.display = 'inline-block';
+        document.getElementById('downloadZipBtn').disabled = false;
+        
+        setStatus(`✅ Базовая обработка завершена! Получено ${Object.keys(processedFiles).length} файлов.`, 'done');
+    } catch (e) {
+        setStatus('❌ Ошибка обработки: ' + e.message, 'error');
+        log('ERROR: ' + e);
+    } finally {
+        document.getElementById('processBtn').disabled = false;
+    }
+}
             
             setStatus('⚙️ Обработка файлов... Смотрите логи ниже.', 'working');
             document.getElementById('processBtn').disabled = true;
@@ -747,6 +805,31 @@ def generate_seasonal_files_on_demand():
                 document.getElementById('processBtn').disabled = false;
             }
         }
+
+        async function generateSeasonalFiles() {
+    setStatus('⚙️ Генерация файлов по сезонам и годам...', 'working');
+    document.getElementById('seasonalBtn').disabled = true;
+    
+    try {
+        // Вызываем новую Python-функцию, которая работает с кэшем
+        await pyodide.runPythonAsync(`seasonal_result = generate_seasonal_files_on_demand()`);
+        const seasonalFiles = pyodide.globals.get('seasonal_result').to_py();
+        
+        // Добавляем новые файлы к уже существующим
+        for (let [filename, content] of Object.entries(seasonalFiles)) {
+            processedFiles[filename] = content;
+        }
+        
+        updateFileList();
+        setStatus(`✅ Добавлено ${Object.keys(seasonalFiles).length} сезонных файлов!`, 'done');
+    } catch (e) {
+        setStatus('❌ Ошибка генерации сезонов: ' + e.message, 'error');
+        log('ERROR: ' + e);
+    } finally {
+        document.getElementById('seasonalBtn').disabled = false;
+    }
+}
+
         
         function downloadSingle(filename, content) {
             const blob = new Blob([content], {type: 'text/csv;charset=utf-8'});
