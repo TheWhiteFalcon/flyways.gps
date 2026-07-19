@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Анализ миграции орланов</title>
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.24.1/full/pyodide.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; max-width: 850px; margin: 40px auto; padding: 20px; background: #fafafa; }
+        h1 { color: #2c3e50; }
+        .controls { margin: 20px 0; padding: 20px; background: #fff; border: 1px solid #ddd; border-radius: 8px; }
+        button { padding: 12px 24px; font-size: 15px; background: #3498db; color: white; border: none; border-radius: 4px; cursor: pointer; margin: 5px 5px 5px 0; }
+        button:disabled { background: #bdc3c7; cursor: not-allowed; }
+        button:hover:not(:disabled) { background: #2980b9; }
+        #log { background: #1e1e1e; color: #d4d4d4; padding: 15px; border-radius: 4px; font-family: 'Consolas', 'Courier New', monospace; font-size: 12px; max-height: 450px; overflow-y: auto; white-space: pre-wrap; margin-top: 20px; line-height: 1.5; }
+        #status { padding: 12px; margin: 10px 0; font-weight: bold; border-radius: 4px; }
+        .ready { color: #27ae60; background: #e8f5e9; }
+        .working { color: #e67e22; background: #fff3e0; }
+        .done { color: #27ae60; background: #e8f5e9; }
+        .error { color: #c0392b; background: #ffebee; }
+        .downloads { margin-top: 20px; padding: 20px; background: #fff; border: 1px solid #ddd; border-radius: 8px; display: none; }
+        .file-list { margin: 15px 0; max-height: 300px; overflow-y: auto; }
+        .file-list a { display: block; padding: 6px 10px; color: #2980b9; text-decoration: none; border-bottom: 1px solid #eee; }
+        .file-list a:hover { background: #f0f8ff; text-decoration: underline; }
+        .warning { background: #fff3cd; border: 1px solid #ffeaa7; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 14px; }
+    </style>
+</head>
+<body>
+    <h1>🦅 Анализ миграции орлана-белохвоста</h1>
+    <p>Загрузите CSV-файлы с данными GPS-GSM трекеров Aquila. Обработка происходит прямо в вашем браузере — файлы никуда не отправляются.</p>
+    
+    <div class="warning">
+        ⚠️ <b>Важно:</b> первая загрузка занимает ~30 секунд (скачивается Python-окружение ~40 МБ). Далее работает мгновенно. Большие файлы (>100 000 точек) могут обрабатываться долго.
+    </div>
+    
+    <div class="controls">
+        <input type="file" id="fileInput" multiple accept=".csv">
+        <br><br>
+        <button id="processBtn" onclick="processFiles()" disabled>🔬 Обработать</button>
+        <button id="downloadZipBtn" onclick="downloadZip()" disabled>📦 Скачать всё в ZIP</button>
+    </div>
+    
+    <div id="status">⏳ Инициализация Python-окружения...</div>
+    <div id="log"></div>
+    
+    <div id="downloads" class="downloads">
+        <h3>✅ Результаты обработки:</h3>
+        <div id="fileList" class="file-list"></div>
+    </div>
+
+    <!-- Python-код в отдельном теге — так не нужно экранировать f-строки -->
+    <script type="text/python" id="python-code">
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from sklearn.cluster import DBSCAN
+from scipy.spatial import ConvexHull
+import warnings
+import io
+import os
+warnings.filterwarnings('ignore')
+
+CONFIG = {
+    'speed_threshold_kmh': 120,
+    'angle_threshold_deg': 150,
+    'nest_buffer_km': 10,
+    'no_return_days': 5,
+    'spring_migration_months': [2, 3, 4, 5],
+    'autumn_migration_months': [9, 10, 11, 12],
+    'wintering_months': [11, 12, 1, 2],
+    'summer_roaming_months': [3, 4, 5, 6, 7, 8, 9],
+    'wintering_min_days': 14,
+    'wintering_cluster_radius_km': 100,
+    'summer_roaming_radius_km': 50,
+    'area_method': 'convex_hull'
+}
+
+YEARS_TO_ANALYZE = None
+
+# Чистая реализация haversine (замена geopy.geodesic)
+def haversine_distance(lat1, lon1, lat2, lon2):
+    R = 6371.0088
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    return R * c
+
+def parse_aquila_csv(content, filename='unknown'):
+    print(f"  📂 Чтение файла: {filename}")
+    lines = content.split('\n')
+    lines = [line.replace('\r', '') for line in lines]
+    print(f"  📄 Всего строк в файле: {len(lines)}")
+    if len(lines) < 2:
+        return pd.DataFrame()
+    data_lines = lines[1:]
+    data_rows = []
+    headers = ['GPS Timestamp', 'Lat', 'Lon', 'Latitude', 'Longitude', 'Speed',
+               'Altitude', 'Course', 'PDOP', 'HDOP', 'VDOP', 'Temperature',
+               'Satellites', 'Panel Voltage', 'Accu Voltage']
+    for line in data_lines:
+        line = line.strip()
+        if not line:
+            continue
+        line = line.replace('""', '\x00')
+        line = line.replace('"', '')
+        line = line.replace('\x00', '')
+        parts = [p.strip() for p in line.split(',')]
+        if len(parts) >= 9:
+            while len(parts) < 15:
+                parts.append('')
+            data_rows.append(parts[:15])
+    print(f"  📊 Строк данных распарсено: {len(data_rows)}")
+    if len(data_rows) == 0:
+        return pd.DataFrame()
+    df = pd.DataFrame(data_rows, columns=headers)
+    print(f"  ✅ DataFrame создан: {len(df)} строк, {len(df.columns)} колонок")
+    return df
+
+def parse_dms_to_decimal(dms_str):
+    if pd.isna(dms_str) or dms_str == '' or dms_str is None:
+        return np.nan
+    try:
+        dms_str = str(dms_str).strip()
+        direction = 1
+        if 'S' in dms_str.upper():
+            direction = -1
+            dms_str = dms_str.upper().replace('S', '')
+        elif 'W' in dms_str.upper():
+            direction = -1
+            dms_str = dms_str.upper().replace('W', '')
+        else:
+            dms_str = dms_str.upper().replace('N', '').replace('E', '')
+        dms_str = dms_str.replace('"', '').replace("'", ' ').strip()
+        parts = dms_str.split()
+        if len(parts) >= 3:
+            deg = float(parts[0])
+            minute = float(parts[1])
+            sec = float(parts[2])
+            decimal = deg + minute / 60 + sec / 3600
+            return round(decimal * direction, 6)
+        elif len(parts) == 2:
+            deg = float(parts[0])
+            minute = float(parts[1])
+            decimal = deg + minute / 60
+            return round(decimal * direction, 6)
+        elif len(parts) == 1:
+            return float(parts[0])
+    except:
+        pass
+    return np.nan
+
+def calculate_speed(df):
+    df = df.sort_index()
+    speeds = []
+    for i in range(len(df)):
+        if i == 0:
+            speeds.append(np.nan)
+        else:
+            dist = haversine_distance(
+                df.iloc[i-1]['lat'], df.iloc[i-1]['lon'],
+                df.iloc[i]['lat'], df.iloc[i]['lon']
+            )
+            time_diff = (df.index[i] - df.index[i-1]).total_seconds() / 3600
+            speeds.append(dist / time_diff if time_diff > 0 else np.nan)
+    df['speed_kmh'] = speeds
+    return df
+
+def filter_by_speed(df, threshold_kmh):
+    return df[(df['speed_kmh'] <= threshold_kmh) | (df['speed_kmh'].isna())].copy()
+
+def calculate_turn_angle(df):
+    df = df.sort_index()
+    angles = [np.nan, np.nan]
+    for i in range(2, len(df)):
+        az1 = np.arctan2(
+            np.sin(np.radians(df.iloc[i-1]['lon'] - df.iloc[i-2]['lon'])) * np.cos(np.radians(df.iloc[i-1]['lat'])),
+            np.cos(np.radians(df.iloc[i-2]['lat'])) * np.sin(np.radians(df.iloc[i-1]['lat'])) -
+            np.sin(np.radians(df.iloc[i-2]['lat'])) * np.cos(np.radians(df.iloc[i-1]['lat'])) *
+            np.cos(np.radians(df.iloc[i-1]['lon'] - df.iloc[i-2]['lon']))
+        )
+        az2 = np.arctan2(
+            np.sin(np.radians(df.iloc[i]['lon'] - df.iloc[i-1]['lon'])) * np.cos(np.radians(df.iloc[i]['lat'])),
+            np.cos(np.radians(df.iloc[i-1]['lat'])) * np.sin(np.radians(df.iloc[i]['lat'])) -
+            np.sin(np.radians(df.iloc[i-1]['lat'])) * np.cos(np.radians(df.iloc[i]['lat'])) *
+            np.cos(np.radians(df.iloc[i]['lon'] - df.iloc[i-1]['lon']))
+        )
+        angle = np.degrees(abs(az2 - az1))
+        angles.append(angle if angle <= 180 else 360 - angle)
+    df['turn_angle'] = angles
+    return df
+
+def filter_by_angle(df, threshold_deg):
+    return df[(df['turn_angle'] <= threshold_deg) | (df['turn_angle'].isna())].copy()
+
+def calculate_area_km2(df_subset, method='convex_hull'):
+    if len(df_subset) < 3:
+        return 0
+    coords = df_subset[['lat', 'lon']].values
+    coords_m = np.column_stack([
+        (coords[:, 0] - coords[:, 0].mean()) * 111_000,
+        (coords[:, 1] - coords[:, 1].mean()) * 111_000 * np.cos(np.radians(coords[:, 0].mean()))
+    ])
+    if method == 'convex_hull':
+        try:
+            hull = ConvexHull(coords_m)
+            area_m2 = hull.volume
+            return round(area_m2 / 1_000_000, 1)
+        except:
+            return 0
+    return 0
+
+def load_and_preprocess(content, filename):
+    df = parse_aquila_csv(content, filename)
+    if df.empty or len(df) == 0:
+        print("  ⚠️ Нет данных для обработки")
+        return pd.DataFrame()
+    df['timestamp'] = pd.to_datetime(df['GPS Timestamp'], errors='coerce', format='%Y-%m-%d %H:%M:%S')
+    valid_timestamps = df['timestamp'].notna().sum()
+    print(f"  ✅ Точек с временем: {valid_timestamps}")
+    df = df.dropna(subset=['timestamp'])
+    if len(df) == 0:
+        print("  ⚠️ Нет данных с корректным временем")
+        return pd.DataFrame()
+    df['lat'] = pd.to_numeric(df['Latitude'], errors='coerce')
+    df['lon'] = pd.to_numeric(df['Longitude'], errors='coerce')
+    valid_coords = df['lat'].notna().sum()
+    print(f"  ✅ Точек с координатами (десятичные): {valid_coords}")
+    if valid_coords < len(df) * 0.5:
+        print(f"  ⚠️ Много NaN, пробуем парсинг DMS из Lat/Lon...")
+        df['lat'] = df['Lat'].apply(parse_dms_to_decimal)
+        df['lon'] = df['Lon'].apply(parse_dms_to_decimal)
+        valid_coords = df['lat'].notna().sum()
+        print(f"  ✅ Точек с координатами (DMS): {valid_coords}")
+    df = df.dropna(subset=['lat', 'lon', 'timestamp'])
+    if len(df) == 0:
+        print("  ⚠️ Нет данных с корректными координатами")
+        return pd.DataFrame()
+    print(f"  📊 Точек с координатами: {len(df)}")
+    print(f"  📅 Период данных: {df['timestamp'].min()} — {df['timestamp'].max()}")
+    print(f"  🌍 Диапазон координат: широта {df['lat'].min():.2f}–{df['lat'].max():.2f}, долгота {df['lon'].min():.2f}–{df['lon'].max():.2f}")
+    df = df.set_index('timestamp').sort_index()
+    df = calculate_speed(df)
+    df = filter_by_speed(df, CONFIG['speed_threshold_kmh'])
+    df = calculate_turn_angle(df)
+    df = filter_by_angle(df, CONFIG['angle_threshold_deg'])
+    print(f"  📊 Точек после фильтрации: {len(df)}")
+    return df
+
+def make_filtered_csv_content(df):
+    df_output = df.reset_index()
+    output_data = {
+        'GPS Timestamp': df_output['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S'),
+        'Lat': df_output['lat'],
+        'Lon': df_output['lon'],
+        'Latitude': df_output['lat'],
+        'Longitude': df_output['lon'],
+        'Speed': df_output.get('speed_kmh', pd.Series([np.nan] * len(df_output))),
+        'Altitude': '', 'Course': '', 'PDOP': '', 'HDOP': '', 'VDOP': '',
+        'Temperature': '', 'Satellites': '', 'Panel Voltage': '', 'Accu Voltage': ''
+    }
+    df_export = pd.DataFrame(output_data)
+    output = io.StringIO()
+    header = ','.join([f'"{col}"' for col in df_export.columns])
+    output.write(header + '\n')
+    for idx, row in df_export.iterrows():
+        values = []
+        for val in row.values:
+            if pd.isna(val):
+                values.append('""')
+            else:
+                values.append(f'"{val}"')
+        output.write(','.join(values) + '\n')
+    return output.getvalue()
+
+def save_filtered_coordinates(df, original_filename, output_suffix='_filtered'):
+    if df.empty:
+        return None, None
+    base_name = os.path.basename(original_filename)
+    name_without_ext = os.path.splitext(base_name)[0]
+    output_filename = f"{name_without_ext}{output_suffix}.csv"
+    content = make_filtered_csv_content(df)
+    print(f"  ✅ Отфильтрованные координаты: {output_filename} ({len(df)} точек)")
+    return output_filename, content
+
+def save_seasonal_coordinates(df, original_filename, season_dates, season_name):
+    if season_dates is None:
+        return None, None
+    start_date = season_dates.get('start_date')
+    end_date = season_dates.get('end_date')
+    if start_date is None or end_date is None:
+        return None, None
+    df_season = df[(df.index >= start_date) & (df.index <= end_date)].copy()
+    if df_season.empty:
+        return None, None
+    base_name = os.path.basename(original_filename)
+    name_without_ext = os.path.splitext(base_name)[0]
+    output_filename = f"{name_without_ext}_filtered_{season_name}.csv"
+    content = make_filtered_csv_content(df_season)
+    print(f"  ✅ Координаты сезона {season_name}: {output_filename} ({len(df_season)} точек)")
+    return output_filename, content
+
+def identify_nest(df):
+    return {'lat': df.iloc[0]['lat'], 'lon': df.iloc[0]['lon'], 'date': df.index[0]}
+
+def find_migration_period(df, year, migration_type='autumn'):
+    months = CONFIG['spring_migration_months'] if migration_type == 'spring' else CONFIG['autumn_migration_months']
+    df_year = df[(df.index.year == year) & (df.index.month.isin(months))]
+    return None if df_year.empty else df_year
+
+def detect_migration_onset(df_subset, nest_coords, full_df=None, migration_type='autumn'):
+    buffer_km = CONFIG['nest_buffer_km']
+    min_no_return_days = CONFIG['no_return_days']
+    df_subset = df_subset.copy()
+    df_subset['dist_from_nest_km'] = df_subset.apply(
+        lambda row: haversine_distance(nest_coords['lat'], nest_coords['lon'], row['lat'], row['lon']), axis=1
+    )
+    for idx in range(len(df_subset)):
+        if df_subset.iloc[idx]['dist_from_nest_km'] > buffer_km:
+            window_end = df_subset.index[idx] + timedelta(days=min_no_return_days)
+            window_data = df_subset[(df_subset.index >= df_subset.index[idx]) & (df_subset.index <= window_end)]
+            if len(window_data) > 0 and (window_data['dist_from_nest_km'] > buffer_km).all():
+                if full_df is not None:
+                    try:
+                        index_in_full = full_df.index.get_loc(df_subset.index[idx])
+                    except KeyError:
+                        index_in_full = idx
+                else:
+                    index_in_full = idx
+                return {
+                    'date': df_subset.index[idx],
+                    'index': index_in_full,
+                    'coords': {'lat': df_subset.iloc[idx]['lat'], 'lon': df_subset.iloc[idx]['lon']}
+                }
+    return None
+
+def calculate_path_length(df, start_idx, end_idx):
+    segment = df.iloc[start_idx:end_idx+1]
+    total = 0
+    for i in range(1, len(segment)):
+        total += haversine_distance(
+            segment.iloc[i-1]['lat'], segment.iloc[i-1]['lon'],
+            segment.iloc[i]['lat'], segment.iloc[i]['lon']
+        )
+    return round(total, 1)
+
+def identify_wintering_period(df, year):
+    df_winter = df[((df.index.year == year) & (df.index.month.isin([11, 12]))) |
+                   ((df.index.year == year + 1) & (df.index.month.isin([1, 2])))]
+    if df_winter.empty:
+        return None
+    coords = df_winter[['lat', 'lon']].values
+    eps_deg = CONFIG['wintering_cluster_radius_km'] / 111
+    db = DBSCAN(eps=eps_deg, min_samples=5).fit(coords)
+    df_winter = df_winter.copy()
+    df_winter['cluster'] = db.labels_
+    best_cluster = None
+    max_duration = 0
+    for cluster_id in df_winter['cluster'].unique():
+        if cluster_id == -1:
+            continue
+        cluster_data = df_winter[df_winter['cluster'] == cluster_id]
+        duration_days = (cluster_data.index.max() - cluster_data.index.min()).days
+        if duration_days >= CONFIG['wintering_min_days'] and duration_days > max_duration:
+            max_duration = duration_days
+            best_cluster = cluster_id
+    if best_cluster is None:
+        return None
+    winter_data = df_winter[df_winter['cluster'] == best_cluster]
+    return {
+        'start_date': winter_data.index.min(),
+        'end_date': winter_data.index.max(),
+        'centroid': {'lat': winter_data['lat'].mean(), 'lon': winter_data['lon'].mean()},
+        'data': winter_data
+    }
+
+def find_index_by_date(df, target_date):
+    if not df.index.is_unique:
+        diffs = np.abs(df.index - target_date)
+        return diffs.argmin()
+    try:
+        idx = df.index.get_indexer([target_date], method='nearest')[0]
+        if idx >= 0:
+            return idx
+    except:
+        pass
+    diffs = np.abs(df.index - target_date)
+    return diffs.argmin()
+
+def analyze_year(df, year, nest_coords, bird_id='unknown'):
+    result = {
+        'bird_id': bird_id, 'year': year, 'age_class': f'птица ({year} год)',
+        'spring_migration_start': '-', 'spring_migration_end': '-',
+        'spring_path_km': '-', 'spring_direct_km': '-', 'spring_linearity': '-', 'spring_duration_days': '-',
+        'summer_roaming_start': '-', 'summer_roaming_end': '-',
+        'autumn_migration_start': '-', 'autumn_migration_end': '-',
+        'autumn_path_km': '-', 'autumn_direct_km': '-', 'autumn_linearity': '-', 'autumn_duration_days': '-',
+        'wintering_start': '-', 'wintering_end': '-',
+        'wintering_area_km2': '-', 'summer_roaming_area_km2': '-', 'total_cycle_area_km2': '-',
+        'wintering_centroid': '-',
+        '_spring_dates': None, '_autumn_dates': None, '_summer_dates': None, '_winter_dates': None
+    }
+    wintering = identify_wintering_period(df, year)
+    if wintering is not None:
+        result['wintering_start'] = wintering['start_date'].strftime('%Y-%m-%d')
+        result['wintering_end'] = wintering['end_date'].strftime('%Y-%m-%d')
+        result['wintering_area_km2'] = round(calculate_area_km2(wintering['data'], CONFIG['area_method']), 1)
+        result['wintering_centroid'] = f"{wintering['centroid']['lat']:.4f}, {wintering['centroid']['lon']:.4f}"
+        result['_winter_dates'] = {'start_date': wintering['start_date'], 'end_date': wintering['end_date']}
+        direct_distance = haversine_distance(
+            nest_coords['lat'], nest_coords['lon'],
+            wintering['centroid']['lat'], wintering['centroid']['lon']
+        )
+    else:
+        direct_distance = 0
+    spring_subset = find_migration_period(df, year, migration_type='spring')
+    if spring_subset is not None and not spring_subset.empty:
+        spring_start = detect_migration_onset(spring_subset, nest_coords, full_df=df, migration_type='spring')
+        if spring_start is not None:
+            result['spring_migration_start'] = spring_start['date'].strftime('%Y-%m-%d')
+            spring_end_date = None
+            for idx in range(spring_start['index'] + 1, len(df)):
+                dist = haversine_distance(nest_coords['lat'], nest_coords['lon'], df.iloc[idx]['lat'], df.iloc[idx]['lon'])
+                if dist <= CONFIG['nest_buffer_km']:
+                    spring_end_date = df.index[idx]
+                    break
+            if spring_end_date is not None:
+                result['spring_migration_end'] = spring_end_date.strftime('%Y-%m-%d')
+                spring_end_idx = find_index_by_date(df, spring_end_date)
+                spring_path_length = calculate_path_length(df, spring_start['index'], spring_end_idx)
+                spring_duration = (spring_end_date - spring_start['date']).days
+                result['_spring_dates'] = {'start_date': spring_start['date'], 'end_date': spring_end_date}
+                if spring_duration > 365:
+                    print(f"    ⚠️ Предупреждение: весенняя миграция длится {spring_duration} дней (> года)")
+                    result['spring_migration_end'] = '-'
+                    result['_spring_dates'] = None
+                elif spring_duration > 0:
+                    result['spring_path_km'] = round(spring_path_length, 1)
+                    result['spring_direct_km'] = round(direct_distance, 1)
+                    result['spring_linearity'] = round(direct_distance / spring_path_length, 2) if spring_path_length > 0 else '-'
+                    result['spring_duration_days'] = spring_duration
+    autumn_subset = find_migration_period(df, year, migration_type='autumn')
+    autumn_start = None
+    if autumn_subset is not None and not autumn_subset.empty:
+        autumn_start = detect_migration_onset(autumn_subset, nest_coords, full_df=df, migration_type='autumn')
+    summer_start_date = None
+    summer_end_date = None
+    if result['spring_migration_end'] != '-':
+        summer_start_date = pd.to_datetime(result['spring_migration_end'])
+    elif result['spring_migration_start'] != '-':
+        summer_start_date = pd.to_datetime(result['spring_migration_start'])
+    if autumn_start is not None:
+        summer_end_date = autumn_start['date']
+    if summer_start_date is not None and summer_end_date is not None:
+        if summer_end_date > summer_start_date:
+            summer_duration = (summer_end_date - summer_start_date).days
+            if summer_duration > 365:
+                print(f"    ⚠️ Предупреждение: летние кочёвки длятся {summer_duration} дней (> года)")
+            else:
+                result['summer_roaming_start'] = summer_start_date.strftime('%Y-%m-%d')
+                result['summer_roaming_end'] = summer_end_date.strftime('%Y-%m-%d')
+                result['_summer_dates'] = {'start_date': summer_start_date, 'end_date': summer_end_date}
+                summer_data = df[(df.index >= summer_start_date) & (df.index < summer_end_date)]
+                if len(summer_data) >= 3:
+                    result['summer_roaming_area_km2'] = round(calculate_area_km2(summer_data, CONFIG['area_method']), 1)
+    if autumn_start is not None:
+        result['autumn_migration_start'] = autumn_start['date'].strftime('%Y-%m-%d')
+        if wintering is not None:
+            result['autumn_migration_end'] = wintering['start_date'].strftime('%Y-%m-%d')
+            autumn_end_idx = find_index_by_date(df, wintering['start_date'])
+            autumn_path_length = calculate_path_length(df, autumn_start['index'], autumn_end_idx)
+            autumn_duration = (wintering['start_date'] - autumn_start['date']).days
+            result['_autumn_dates'] = {'start_date': autumn_start['date'], 'end_date': wintering['start_date']}
+            if autumn_duration > 365:
+                print(f"    ⚠️ Предупреждение: осенняя миграция длится {autumn_duration} дней (> года)")
+                result['autumn_migration_end'] = '-'
+                result['_autumn_dates'] = None
+            elif autumn_duration > 0:
+                result['autumn_path_km'] = round(autumn_path_length, 1)
+                result['autumn_direct_km'] = round(direct_distance, 1)
+                result['autumn_linearity'] = round(direct_distance / autumn_path_length, 2) if autumn_path_length > 0 else '-'
+                result['autumn_duration_days'] = autumn_duration
+    cycle_dates = []
+    if result['spring_migration_start'] != '-':
+        cycle_dates.append(pd.to_datetime(result['spring_migration_start']))
+    if result['summer_roaming_start'] != '-':
+        cycle_dates.append(pd.to_datetime(result['summer_roaming_start']))
+    if result['autumn_migration_start'] != '-':
+        cycle_dates.append(pd.to_datetime(result['autumn_migration_start']))
+    if result['wintering_end'] != '-':
+        cycle_dates.append(pd.to_datetime(result['wintering_end']))
+    if len(cycle_dates) >= 2:
+        cycle_start = min(cycle_dates)
+        cycle_end = max(cycle_dates)
+        cycle_duration = (cycle_end - cycle_start).days
+        if cycle_duration > 365:
+            print(f"    ⚠️ Предупреждение: годовой цикл длится {cycle_duration} дней (> года)")
+        else:
+            cycle_data = df[(df.index >= cycle_start) & (df.index <= cycle_end)]
+            if len(cycle_data) >= 3:
+                result['total_cycle_area_km2'] = round(calculate_area_km2(cycle_data, CONFIG['area_method']), 1)
+    return result
+
+def analyze_all_years(content, filename, bird_id='unknown'):
+    df = load_and_preprocess(content, filename)
+    if df.empty or len(df) < 10:
+        print("  ⚠️ Недостаточно данных после фильтрации")
+        return [], df
+    nest = identify_nest(df)
+    available_years = df.index.year.unique()
+    print(f"  📊 Доступные годы в данных: {sorted(available_years)}")
+    all_results = []
+    years_to_process = sorted(available_years) if YEARS_TO_ANALYZE is None else YEARS_TO_ANALYZE
+    for year in years_to_process:
+        if year not in available_years:
+            continue
+        print(f"\n  🔍 Анализ года {year}...")
+        year_result = analyze_year(df, year, nest, bird_id=bird_id)
+        if 'error' not in year_result:
+            has_migration = (
+                year_result['spring_migration_start'] != '-' or
+                year_result['autumn_migration_start'] != '-' or
+                year_result['wintering_start'] != '-'
+            )
+            if has_migration:
+                print(f"    ✅ Данные за год найдены")
+                all_results.append(year_result)
+    return all_results, df
+
+def process_all_files(files_dict):
+    """Главная функция веб-версии. files_dict = {filename: content}"""
+    output_files = {}
+    all_results = []
+    for filename, content in files_dict.items():
+        print(f"\n{'='*60}")
+        print(f"🦅 Обработка файла: {filename}")
+        print('='*60)
+        bird_name = os.path.splitext(filename)[0]
+        results, df_filtered = analyze_all_years(content, filename, bird_id=bird_name)
+        all_results.extend(results)
+        if not df_filtered.empty:
+            fname, fcontent = save_filtered_coordinates(df_filtered, filename)
+            if fname:
+                output_files[fname] = fcontent
+            if results:
+                for year_result in results:
+                    year = year_result.get('year', 'unknown')
+                    year_suffix = f'_y{year}' if len(results) > 1 else ''
+                    for season_key, season_name in [('_spring_dates', f'spring{year_suffix}'),
+                                                     ('_autumn_dates', f'autumn{year_suffix}'),
+                                                     ('_summer_dates', f'summer{year_suffix}'),
+                                                     ('_winter_dates', f'winter{year_suffix}')]:
+                        dates = year_result.get(season_key)
+                        if dates is not None:
+                            fname, fcontent = save_seasonal_coordinates(df_filtered, filename, dates, season_name)
+                            if fname:
+                                output_files[fname] = fcontent
+        if results:
+            df_bird_results = pd.DataFrame(results)
+            df_bird_results = df_bird_results.sort_values(['year'])
+            column_order = [
+                'bird_id', 'year', 'age_class',
+                'spring_migration_start', 'spring_migration_end',
+                'spring_path_km', 'spring_direct_km', 'spring_linearity', 'spring_duration_days',
+                'summer_roaming_start', 'summer_roaming_end',
+                'autumn_migration_start', 'autumn_migration_end',
+                'autumn_path_km', 'autumn_direct_km', 'autumn_linearity', 'autumn_duration_days',
+                'wintering_start', 'wintering_end',
+                'wintering_area_km2', 'summer_roaming_area_km2', 'total_cycle_area_km2',
+                'wintering_centroid'
+            ]
+            existing_columns = [col for col in column_order if col in df_bird_results.columns]
+            df_bird_results = df_bird_results[existing_columns]
+            summary_filename = f'{bird_name}-summary.csv'
+            summary_content = df_bird_results.to_csv(index=False, sep=';', encoding='utf-8-sig')
+            output_files[summary_filename] = summary_content
+            print(f"\n✅ Summary для {bird_name} готов")
+    if all_results:
+        df_results = pd.DataFrame(all_results)
+        df_results = df_results.sort_values(['bird_id', 'year'])
+        column_order = [
+            'bird_id', 'year', 'age_class',
+            'spring_migration_start', 'spring_migration_end',
+            'spring_path_km', 'spring_direct_km', 'spring_linearity', 'spring_duration_days',
+            'summer_roaming_start', 'summer_roaming_end',
+            'autumn_migration_start', 'autumn_migration_end',
+            'autumn_path_km', 'autumn_direct_km', 'autumn_linearity', 'autumn_duration_days',
+            'wintering_start', 'wintering_end',
+            'wintering_area_km2', 'summer_roaming_area_km2', 'total_cycle_area_km2',
+            'wintering_centroid'
+        ]
+        existing_columns = [col for col in column_order if col in df_results.columns]
+        df_results = df_results[existing_columns]
+        full_summary_content = df_results.to_csv(index=False, sep=';', encoding='utf-8-sig')
+        output_files['migration_summary_full.csv'] = full_summary_content
+        print(f"\n✅ Общий summary готов")
+    else:
+        print("❌ Нет данных для вывода")
+    return output_files
+    </script>
+
+    <script>
+        let pyodide;
+        let processedFiles = {};
+        
+        function log(msg) {
+            const logEl = document.getElementById('log');
+            logEl.textContent += msg + '\n';
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+        
+        function setStatus(msg, className) {
+            const s = document.getElementById('status');
+            s.textContent = msg;
+            s.className = className || '';
+        }
+        
+        async function init() {
+            try {
+                log('Загрузка Pyodide (~10 МБ)...');
+                pyodide = await loadPyodide();
+                log('Установка пакетов: pandas, numpy, scipy, scikit-learn (~30 МБ)...');
+                setStatus('⏳ Установка научных библиотек Python (это займёт ~30 секунд)...', 'working');
+                await pyodide.loadPackage(['pandas', 'numpy', 'scipy', 'scikit-learn']);
+                
+                const pyCode = document.getElementById('python-code').textContent;
+                log('Загрузка скрипта анализа...');
+                await pyodide.runPythonAsync(pyCode);
+                
+                pyodide.setStdout({ batched: (msg) => log(msg) });
+                pyodide.setStderr({ batched: (msg) => log('ERROR: ' + msg) });
+                
+                setStatus('✅ Готово к работе! Выберите CSV-файлы и нажмите "Обработать".', 'ready');
+                document.getElementById('processBtn').disabled = false;
+                log('✅ Инициализация завершена. Можно начинать работу.');
+            } catch (e) {
+                setStatus('❌ Ошибка инициализации: ' + e.message, 'error');
+                log('ERROR: ' + e);
+            }
+        }
+        
+        async function processFiles() {
+            const files = document.getElementById('fileInput').files;
+            if (files.length === 0) {
+                alert('Выберите хотя бы один CSV файл!');
+                return;
+            }
+            
+            setStatus('⚙️ Обработка файлов... Смотрите логи ниже.', 'working');
+            document.getElementById('processBtn').disabled = true;
+            document.getElementById('log').textContent = '';
+            processedFiles = {};
+            
+            const filesDict = {};
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                filesDict[file.name] = await file.text();
+            }
+            
+            try {
+                pyodide.globals.set('input_files', filesDict);
+                await pyodide.runPythonAsync(`result = process_all_files(input_files)`);
+                const result = pyodide.globals.get('result').toJs({dict_converter: Object.fromEntries});
+                
+                processedFiles = result;
+                
+                const fileList = document.getElementById('fileList');
+                fileList.innerHTML = '';
+                for (let filename of Object.keys(processedFiles)) {
+                    const a = document.createElement('a');
+                    a.href = '#';
+                    a.textContent = '📄 ' + filename;
+                    a.onclick = (e) => {
+                        e.preventDefault();
+                        downloadSingle(filename, processedFiles[filename]);
+                    };
+                    fileList.appendChild(a);
+                }
+                
+                document.getElementById('downloads').style.display = 'block';
+                document.getElementById('downloadZipBtn').disabled = false;
+                setStatus(`✅ Обработано! Получено ${Object.keys(processedFiles).length} файлов.`, 'done');
+            } catch (e) {
+                setStatus('❌ Ошибка обработки: ' + e.message, 'error');
+                log('ERROR: ' + e);
+            } finally {
+                document.getElementById('processBtn').disabled = false;
+            }
+        }
+        
+        function downloadSingle(filename, content) {
+            const blob = new Blob([content], {type: 'text/csv;charset=utf-8'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+        
+        async function downloadZip() {
+            if (Object.keys(processedFiles).length === 0) return;
+            setStatus('📦 Создание ZIP-архива...', 'working');
+            const zip = new JSZip();
+            for (let [filename, content] of Object.entries(processedFiles)) {
+                zip.file(filename, content);
+            }
+            const blob = await zip.generateAsync({type: 'blob'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'migration_analysis_results.zip';
+            a.click();
+            URL.revokeObjectURL(url);
+            setStatus(`✅ ZIP-архив скачан!`, 'done');
+        }
+        
+        init();
+    </script>
+</body>
+</html>
