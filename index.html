@@ -24,6 +24,13 @@
         .file-list a:hover { background: #f0f8ff; text-decoration: underline; }
         .warning { background: #fff3cd; border: 1px solid #ffeaa7; padding: 10px; border-radius: 4px; margin: 10px 0; font-size: 14px; }
     </style>
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js')
+            .then(() => console.log('Service Worker зарегистрирован'))
+            .catch(err => console.log('Ошибка SW:', err));
+        }
+    </script>
 </head>
 <body>
     <h1>🦅 Анализ миграции орлана-белохвоста</h1>
