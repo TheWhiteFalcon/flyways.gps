@@ -530,8 +530,8 @@ def analyze_all_years(content, filename, bird_id='unknown'):
 
 def process_all_files(files_dict):
     """Главная функция веб-версии. files_dict = {filename: content}"""
-    # Конвертируем PyProxy в обычный Python dict
-    files_dict = dict(files_dict)
+    # Конвертируем JsProxy в обычный Python dict
+    files_dict = files_dict.to_py()
     output_files = {}
     all_results = []
     for filename, content in files_dict.items():
