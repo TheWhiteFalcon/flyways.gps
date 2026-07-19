@@ -41,10 +41,11 @@
     </div>
     
     <div class="controls">
-        <input type="file" id="fileInput" multiple accept=".csv">
-        <br><br>
-        <button id="processBtn" onclick="processFiles()" disabled>🔬 Обработать</button>
-        <button id="downloadZipBtn" onclick="downloadZip()" disabled>📦 Скачать всё в ZIP</button>
+    <input type="file" id="fileInput" multiple accept=".csv">
+    <br><br>
+    <button id="processBtn" onclick="processFiles()" disabled>🔬 Обработать (базовый режим)</button>
+    <button id="seasonalBtn" onclick="generateSeasonalFiles()" disabled style="display: none; background: #9b59b6;">📅 Дополнительно: разбить по сезонам и годам</button>
+    <button id="downloadZipBtn" onclick="downloadZip()" disabled style="background: #27ae60;">📦 Скачать всё в ZIP</button>
     </div>
     
     <div id="status">⏳ Инициализация Python-окружения...</div>
